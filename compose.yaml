@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: nebuli
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: nebuli
+    ports:
+      - '127.0.0.1:15432:5432'
+    volumes:
+      - nebuli_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U nebuli -d nebuli']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+volumes:
+  nebuli_postgres:

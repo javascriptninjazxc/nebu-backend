@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+
+# Local reports, editor files and temporary artifacts
+.artifacts/
+.cache/
+.vscode/
+.idea/
+*-result.json
+*.tmp
+*.bak
+.DS_Store
