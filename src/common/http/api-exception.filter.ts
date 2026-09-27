@@ -1,9 +1,9 @@
 import {
-  type ArgumentsHost,
   Catch,
   HttpException,
   HttpStatus,
   Logger,
+  type ArgumentsHost,
   type ExceptionFilter,
 } from '@nestjs/common'
 import type { Response } from 'express'

@@ -1,72 +1,68 @@
+import { Inject, Injectable } from '@nestjs/common'
+import { randomUUID } from 'node:crypto'
+import { Op, Transaction } from 'sequelize'
+import { digest } from '../auth/password.utils.js'
+import { BonusBetsModel } from '../bonuses/bonus-bets.model.js'
+import { BonusRoundsModel } from '../bonuses/bonus-rounds.model.js'
+import type { CommandDto, RoundDto, StatusDto, SyncDto } from '../dice/dto.js'
+import { DiceError } from '../dice/errors.js'
+import { DiceWallet } from '../dice/models.js'
+import { GameAccountService } from './account.service.js'
+import type { Identity } from './account.types.js'
+import {
+  CHEST_BONUS_ODDS,
+  CHEST_ITEMS,
+  CHEST_ODDS,
+  chestBoostedPay,
+  chestFraction,
+  chestKey,
+  chestPay,
+  chestV3Odds,
+  chestV3Value,
+} from './chest-rules.js'
+import { CHEST_V4_SURVIVAL, calculateSpinOutcome, chestV4Value } from './chest-v4.js'
 import {
   CHEST_V5_SURVIVAL,
   calculateSpinOutcome as calculateV5Outcome,
   chestV5Value,
 } from './chest-v5.js'
-import { CHEST_V4_SURVIVAL, calculateSpinOutcome, chestV4Value } from './chest-v4.js'
-import {
-  CHEST_ODDS,
-  CHEST_BONUS_ODDS,
-  CHEST_ITEMS,
-  chestPay,
-  chestKey,
-  chestBoostedPay,
-  chestFraction,
-  chestV3Value,
-  chestV3Odds,
-} from './chest-rules.js'
-import { Inject, Injectable } from '@nestjs/common'
-import { createHash, randomUUID } from 'node:crypto'
-import type { Transaction } from 'sequelize'
-import { GameAccountService, type Identity } from './account.service.js'
-import { NetworkJackpotsService } from './network-jackpots.service.js'
-import { OriginalsRandom, FOREST_SECTORS, forestPay, cachePay } from './random.js'
-import { DiceError } from '../dice/errors.js'
-import type { CommandDto, RoundDto, SyncDto, StatusDto } from '../dice/dto.js'
 import type {
-  ForestStartDto,
-  CacheStartDto,
-  CacheRevealDto,
-  ForestSpinDto,
-  DrawDto,
-  JackpotSyncDto,
-} from './dto.js'
-import type {
+  CachesData,
+  ChestData,
+  ForestData,
   OriginalGame,
   OriginalRound,
   OriginalState,
   OriginalsEvent,
   OriginalsReply,
-  ForestData,
-  CachesData,
-  ChestData,
 } from './contracts.js'
-
-type Round = {
-  id: string
-  user_id: string
-  game: OriginalGame
-  stake: string
-  active: boolean
-  version: number
-  rules_version: string
-  state: ForestData | CachesData | ChestData
-  secret: { mask?: number }
-  payout: string
-}
-
-const digest = (s: string) => createHash('sha256').update(s).digest('hex')
-
-const TAU = Math.PI * 2
+import type {
+  CacheRevealDto,
+  CacheStartDto,
+  DrawDto,
+  ForestSpinDto,
+  ForestStartDto,
+  JackpotSyncDto,
+} from './dto.js'
+import { NetworkJackpotsService } from './network-jackpots.service.js'
+import { OriginalCommandsModel } from './original-commands.model.js'
+import { OriginalProgressModel } from './original-progress.model.js'
+import { OriginalRoundsModel } from './original-rounds.model.js'
+import { TAU } from './originals.constants.js'
+import { OriginalsRepository } from './originals.repository.js'
+import type { Round } from './originals.types.js'
+import { FOREST_SECTORS, OriginalsRandom, cachePay, forestPay } from './random.js'
 
 @Injectable()
 export class OriginalsService {
   constructor(
+    @Inject(OriginalsRepository) private readonly repository: OriginalsRepository,
     @Inject(GameAccountService) private readonly account: GameAccountService,
     @Inject(OriginalsRandom) private readonly random: OriginalsRandom,
     @Inject(NetworkJackpotsService)
     private readonly jackpots: NetworkJackpotsService,
   ) {}
+
   private present(r: Round): OriginalRound {
     const state = r.state
 
@@ -135,26 +131,32 @@ export class OriginalsService {
       data,
     }
   }
+
   private async view(
     user: string,
     game: OriginalGame,
     t: Transaction,
     id?: string,
   ): Promise<OriginalState> {
-    const rows = await this.account.rows<Round>(
-      'SELECT * FROM original_rounds WHERE user_id=:user AND game=:game ORDER BY created_at DESC,id DESC LIMIT 8',
-      { user, game },
-      t,
-    )
+    const rows = await OriginalRoundsModel.findAll({
+      where: { user_id: user, game: game },
+      order: [
+        ['created_at', 'DESC'],
+        ['id', 'DESC'],
+      ],
+      limit: 8,
+      transaction: t,
+      raw: true,
+    })
 
     let round = rows.find((r) => r.active) ?? rows[0]
 
     if (id) {
-      const [selected] = await this.account.rows<Round>(
-        'SELECT * FROM original_rounds WHERE id=:id AND user_id=:user AND game=:game',
-        { id, user, game },
-        t,
-      )
+      const selected = await OriginalRoundsModel.findOne({
+        where: { id: id, user_id: user, game: game },
+        transaction: t,
+        raw: true,
+      })
 
       if (!selected) {
         throw new DiceError('ROUND_NOT_FOUND', 'Раунд не найден.')
@@ -163,15 +165,20 @@ export class OriginalsService {
       round = selected
     }
 
-    const [wallet] = await this.account.rows<{
-      balance: string
-      version: number
-    }>('SELECT balance,version FROM dice_wallets WHERE user_id=:user', { user }, t)
+    const wallet = await DiceWallet.findOne({
+      rejectOnEmpty: true,
+      attributes: ['balance', 'version'],
+      where: { userId: user },
+      transaction: t,
+      raw: true,
+    })
 
-    const [progress] = await this.account.rows<{
-      crystals: number
-      crystal_bonus: string
-    }>('SELECT crystals,crystal_bonus FROM original_progress WHERE user_id=:user', { user }, t)
+    const progress = await OriginalProgressModel.findOne({
+      attributes: ['crystals', 'crystal_bonus'],
+      where: { user_id: user },
+      transaction: t,
+      raw: true,
+    })
 
     return {
       bonusGrants: await this.account.bonuses.grants(user, t),
@@ -183,6 +190,7 @@ export class OriginalsService {
       crystalBonusMinor: progress?.crystal_bonus ?? '0',
     }
   }
+
   private async settle(r: Round, amount: string, t: Transaction) {
     r.active = false
     r.payout = amount
@@ -198,19 +206,14 @@ export class OriginalsService {
       await this.account.money(r.user_id, r.id, amount, 'PAYOUT', t, 'original')
     }
   }
+
   private async save(r: Round, t: Transaction) {
-    await this.account.rows(
-      'UPDATE original_rounds SET active=:active,version=:version,state=CAST(:state AS JSONB),payout=:payout WHERE id=:id RETURNING id',
-      {
-        id: r.id,
-        active: r.active,
-        version: r.version,
-        state: JSON.stringify(r.state),
-        payout: r.payout,
-      },
-      t,
+    await OriginalRoundsModel.update(
+      { active: r.active, version: r.version, state: r.state, payout: r.payout },
+      { where: { id: r.id }, transaction: t },
     )
   }
+
   private async forest(r: Round, event: OriginalsEvent, input: CommandDto, t: Transaction) {
     const s = r.state as ForestData
 
@@ -235,30 +238,29 @@ export class OriginalsService {
 
         let award = '0'
 
-        const wheelFree = await this.account.rows(
-          'SELECT round_id FROM bonus_rounds WHERE round_id=:id UNION ALL SELECT round_id FROM bonus_bets WHERE round_id=:id',
-          { id: r.id },
-          t,
-        )
+        const wheelFree = await Promise.all([
+          BonusRoundsModel.findByPk(r.id, { transaction: t }),
+          BonusBetsModel.findByPk(r.id, { transaction: t }),
+        ]).then((rounds) => rounds.filter(Boolean))
 
         if (finding === 'crystal' && wheelFree.length) {
           award = forestPay(r.stake, 1n, 2n)
           s.message = 'Выигрыш бесплатного раунда — на бонусном балансе.'
         } else if (finding === 'crystal') {
-          await this.account.rows(
-            'INSERT INTO original_progress(user_id) VALUES(:user) ON CONFLICT DO NOTHING RETURNING user_id',
-            { user: r.user_id },
-            t,
-          )
+          await OriginalProgressModel.findOrCreate({
+            where: { user_id: r.user_id },
+            defaults: { user_id: r.user_id },
+            transaction: t,
+          })
 
-          const [progress] = await this.account.rows<{
-            crystals: number
-            crystal_bonus: string
-          }>(
-            'SELECT crystals,crystal_bonus FROM original_progress WHERE user_id=:user FOR UPDATE',
-            { user: r.user_id },
-            t,
-          )
+          const progress = await OriginalProgressModel.findOne({
+            rejectOnEmpty: true,
+            attributes: ['crystals', 'crystal_bonus'],
+            where: { user_id: r.user_id },
+            transaction: t,
+            lock: Transaction.LOCK.UPDATE,
+            raw: true,
+          })
 
           const count = progress.crystals + 1
 
@@ -266,10 +268,9 @@ export class OriginalsService {
 
           const bonus = count % 5 === 0 ? (bank / 100n) * 100n : 0n
 
-          await this.account.rows(
-            'UPDATE original_progress SET crystals=:count,crystal_bonus=:bank WHERE user_id=:user RETURNING user_id',
-            { user: r.user_id, count, bank: (bank - bonus).toString() },
-            t,
+          await OriginalProgressModel.update(
+            { crystals: count, crystal_bonus: (bank - bonus).toString() },
+            { where: { user_id: r.user_id }, transaction: t },
           )
           s.crystalAwardMinor = bonus.toString()
           award = (BigInt(forestPay(r.stake, 1n, 2n)) + bonus).toString()
@@ -359,6 +360,7 @@ export class OriginalsService {
       throw new DiceError('VALIDATION_ERROR', 'Неизвестное действие.')
     }
   }
+
   private async caches(r: Round, event: OriginalsEvent, input: CommandDto, t: Transaction) {
     const s = r.state as CachesData
 
@@ -408,6 +410,7 @@ export class OriginalsService {
       await this.settle(r, s.offerMinor, t)
     }
   }
+
   private async chest(r: Round, event: OriginalsEvent, t: Transaction) {
     const s = r.state as ChestData
 
@@ -579,14 +582,15 @@ export class OriginalsService {
       await this.settle(r, s.offerMinor, t)
     }
   }
+
   async command(
     identity: Identity,
     event: OriginalsEvent,
     input: CommandDto,
   ): Promise<OriginalsReply> {
     return this.account.db.transaction(async (t) => {
-      await this.account.rows("SET LOCAL lock_timeout='3s'", {}, t)
-      await this.account.rows("SET LOCAL statement_timeout='5s'", {}, t)
+      await this.repository.setLockTimeout(t)
+      await this.repository.setStatementTimeout(t)
 
       const who = await this.account.session(identity.sessionHash, t)
 
@@ -596,24 +600,18 @@ export class OriginalsService {
 
       const user = who.userId
 
-      await this.account.rows(
-        'SELECT pg_advisory_xact_lock(hashtextextended(:user,70419))',
-        { user },
-        t,
-      )
+      await this.repository.lockAccount({ user }, t)
 
       const payloadHash = digest(
         JSON.stringify([event, Object.entries(input).sort(([a], [b]) => a.localeCompare(b))]),
       )
 
-      const [old] = await this.account.rows<{
-        payload_hash: string
-        response: OriginalsReply
-      }>(
-        'SELECT payload_hash,response FROM original_commands WHERE user_id=:user AND request_id=:id',
-        { user, id: input.requestId },
-        t,
-      )
+      const old = await OriginalCommandsModel.findOne({
+        attributes: ['payload_hash', 'response'],
+        where: { user_id: user, request_id: input.requestId },
+        transaction: t,
+        raw: true,
+      })
 
       if (old) {
         if (old.payload_hash !== payloadHash) {
@@ -626,11 +624,15 @@ export class OriginalsService {
       const wallet = await this.account.wallet(user, t)
 
       if (event.endsWith('.commandStatus')) {
-        const [saved] = await this.account.rows<{ response: OriginalsReply }>(
-          'SELECT response FROM original_commands WHERE user_id=:user AND request_id=:id',
-          { user, id: (input as StatusDto).operationId },
-          t,
-        )
+        const saved = await OriginalCommandsModel.findOne({
+          attributes: ['response'],
+          where: {
+            user_id: user,
+            request_id: (input as StatusDto).operationId,
+          },
+          transaction: t,
+          raw: true,
+        })
 
         return {
           ok: true,
@@ -666,11 +668,12 @@ export class OriginalsService {
         if (event.endsWith('.start')) {
           if (
             (
-              await this.account.rows(
-                'SELECT id FROM original_rounds WHERE user_id=:user AND game=:game AND active',
-                { user, game },
-                t,
-              )
+              await OriginalRoundsModel.findAll({
+                attributes: ['id'],
+                where: { user_id: user, game: game, active: true },
+                transaction: t,
+                raw: true,
+              })
             ).length
           ) {
             throw new DiceError('ACTIVE_ROUND_EXISTS', 'Заверши текущий раунд.')
@@ -743,18 +746,18 @@ export class OriginalsService {
             secret: game === 'caches' ? { mask: this.random.deck() } : {},
             payout: '0',
           }
-          await this.account.rows(
-            'INSERT INTO original_rounds(id,user_id,game,stake,active,rules_version,state,secret,created_at) VALUES(:id,:user,:game,:stake,TRUE,:rules,CAST(:state AS JSONB),CAST(:secret AS JSONB),clock_timestamp()) RETURNING id',
+          await OriginalRoundsModel.create(
             {
               id: r.id,
-              user,
+              user_id: user,
               game,
               stake,
-              rules: r.rules_version,
-              state: JSON.stringify(state),
-              secret: JSON.stringify(r.secret),
+              active: true,
+              rules_version: r.rules_version,
+              state,
+              secret: r.secret,
             },
-            t,
+            { transaction: t },
           )
 
           if (bonusId) {
@@ -782,11 +785,12 @@ export class OriginalsService {
         } else {
           const dto = input as RoundDto
 
-          const [row] = await this.account.rows<Round>(
-            'SELECT * FROM original_rounds WHERE user_id=:user AND game=:game AND id=:id FOR UPDATE',
-            { user, game, id: dto.roundId },
-            t,
-          )
+          const row = await OriginalRoundsModel.findOne({
+            where: { user_id: user, game: game, id: dto.roundId },
+            transaction: t,
+            lock: Transaction.LOCK.UPDATE,
+            raw: true,
+          })
 
           if (!row) {
             throw new DiceError('ROUND_NOT_FOUND', 'Раунд не найден.')
@@ -839,15 +843,14 @@ export class OriginalsService {
         response = { ok: true, requestId: input.requestId, data }
       }
 
-      await this.account.rows(
-        'INSERT INTO original_commands(user_id,request_id,payload_hash,response) VALUES(:user,:id,:hash,CAST(:response AS JSONB)) RETURNING request_id',
+      await OriginalCommandsModel.create(
         {
-          user,
-          id: input.requestId,
-          hash: payloadHash,
-          response: JSON.stringify(response),
+          user_id: user,
+          request_id: input.requestId,
+          payload_hash: payloadHash,
+          response,
         },
-        t,
+        { transaction: t },
       )
 
       return response

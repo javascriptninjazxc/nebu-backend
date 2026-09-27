@@ -1,25 +1,25 @@
-import { fundTestWallet } from './fund-wallet.js'
-import { LiveWinsController } from '../src/games/live-wins.controller.js'
-import { Test } from '@nestjs/testing'
 import type { NestExpressApplication } from '@nestjs/platform-express'
-import { Sequelize } from 'sequelize-typescript'
-import { QueryTypes } from 'sequelize'
+import { Test } from '@nestjs/testing'
 import { createHash, randomUUID } from 'node:crypto'
+import { QueryTypes } from 'sequelize'
+import { Sequelize } from 'sequelize-typescript'
 import { io, type Socket } from 'socket.io-client'
 import { AppModule } from '../src/app.module.js'
 import { AuthService } from '../src/auth/auth.service.js'
 import { DiceService } from '../src/dice/dice.service.js'
-import { NetworkJackpotsService } from '../src/games/network-jackpots.service.js'
-import { OriginalsRandom } from '../src/games/random.js'
 import { DiceEntry } from '../src/dice/models.js'
 import type {
-  OriginalState,
-  OriginalsReply,
-  ForestData,
   CachesData,
   ChestData,
+  ForestData,
   NetworkState,
+  OriginalState,
+  OriginalsReply,
 } from '../src/games/contracts.js'
+import { LiveWinsController } from '../src/games/live-wins.controller.js'
+import { NetworkJackpotsService } from '../src/games/network-jackpots.service.js'
+import { OriginalsRandom } from '../src/games/random.js'
+import { fundTestWallet } from './fund-wallet.js'
 
 describe('server Originals and network jackpots', () => {
   let app: NestExpressApplication

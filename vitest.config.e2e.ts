@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { loadEnvFile } from 'node:process'
-import { defineConfig } from 'vitest/config'
 import tsconfigPaths from 'vite-tsconfig-paths'
+import { defineConfig } from 'vitest/config'
 
 if (existsSync('.env')) {
   loadEnvFile('.env')

@@ -1,107 +1,79 @@
-import type { BonusGrant } from './contracts.js'
-import { DiceError } from '../dice/errors.js'
-import { Inject, Injectable, ForbiddenException } from '@nestjs/common'
+import { ForbiddenException, Inject, Injectable, UnauthorizedException } from '@nestjs/common'
+import { randomUUID } from 'node:crypto'
+import { col, literal, Op, Transaction } from 'sequelize'
 import { Sequelize } from 'sequelize-typescript'
-import { QueryTypes, type Transaction } from 'sequelize'
-import { createHash, randomInt, randomUUID } from 'node:crypto'
-
-export const BONUS_PRIZES = [
-  { game: 'forest', rounds: 5, stake: '1000', weight: 30 },
-  { game: 'caches', rounds: 10, stake: '1000', weight: 20 },
-  { game: 'dice', rounds: 5, stake: '2000', weight: 15 },
-  { game: 'chest', rounds: 10, stake: '2000', weight: 10 },
-  { game: 'forest', rounds: 5, stake: '3000', weight: 12 },
-  { game: 'caches', rounds: 5, stake: '5000', weight: 8 },
-  { game: 'dice', rounds: 3, stake: '10000', weight: 3 },
-  { game: 'chest', rounds: 5, stake: '10000', weight: 2 },
-] as const
-type Settings = {
-  wager_multiplier: string
-  round_days: number
-  weekly_deposit_minor: string
-}
-type Draw = {
-  id: string
-  user_id: string | null
-  prize_index: number
-  game: string
-  rounds: number
-  stake: string
-  wager_multiplier: string
-  round_days: number
-  claimed_at: Date | null
-  mode: string
-}
-type Grant = {
-  id: string
-  game: string
-  stake: string
-  remaining: number
-  expires_at: Date
-  wager_multiplier: string
-  winnings: string
-  balance: string
-  released_amount: string
-  required: string
-  wagered: string
-  released: boolean
-}
-
-export const guestDigest = (token: string) => createHash('sha256').update(token).digest('hex')
-
-export function choosePrize(value = randomInt(100)) {
-  for (const [i, p] of BONUS_PRIZES.entries()) {
-    value -= p.weight
-
-    if (value < 0) {
-      return i
-    }
-  }
-
-  throw new Error('Invalid prize roll')
-}
+import { AuthSession } from '../auth/models.js'
+import { DiceError } from '../dice/errors.js'
+import { DiceEntry, DiceWallet } from '../dice/models.js'
+import { BonusBetsModel } from './bonus-bets.model.js'
+import { BonusDrawsModel } from './bonus-draws.model.js'
+import { BonusGrantsModel } from './bonus-grants.model.js'
+import { BonusRoundsModel } from './bonus-rounds.model.js'
+import { BonusSettingsModel } from './bonus-settings.model.js'
+import { BONUS_PRIZES } from './bonus.constants.js'
+import { BonusRepository } from './bonus.repository.js'
+import type { Settings } from './bonus.types.js'
+import type { Draw } from './bonus.types.js'
+import { choosePrize, guestDigest } from './bonus.utils.js'
+import type { BonusGrant } from './contracts.js'
 
 @Injectable()
 export class BonusService {
-  constructor(@Inject(Sequelize) readonly db: Sequelize) {}
-  rows<T extends object>(
-    sql: string,
-    replacements: Record<string, unknown> = {},
-    transaction?: Transaction,
-  ) {
-    return this.db.query<T>(sql, {
-      replacements,
-      transaction,
-      type: QueryTypes.SELECT,
+  constructor(
+    @Inject(BonusRepository) private readonly repository: BonusRepository,
+    @Inject(Sequelize) readonly db: Sequelize,
+  ) {}
+
+  async identity(auth?: string) {
+    if (!auth) {
+      return null
+    }
+
+    if (!/^Bearer [A-Za-z0-9_-]{43}$/.test(auth)) {
+      throw new UnauthorizedException()
+    }
+
+    const s = await AuthSession.findOne({
+      attributes: ['userId'],
+      where: {
+        [Op.and]: [
+          { hash: guestDigest(auth.slice(7)) },
+          { expiresAt: { [Op.gt]: literal('NOW()') } },
+        ],
+      },
+      transaction: undefined,
+      raw: true,
     })
+
+    if (!s) {
+      throw new UnauthorizedException()
+    }
+
+    return s.userId
   }
+
   async lock(user: string, t: Transaction) {
-    await this.rows('SELECT pg_advisory_xact_lock(hashtextextended(:user,70419))', { user }, t)
+    await this.repository.lockAccount({ user }, t)
   }
+
   async guestLock(guest: string, t: Transaction) {
-    await this.rows('SELECT pg_advisory_xact_lock(hashtextextended(:guest,70420))', { guest }, t)
+    await this.repository.lockGuest({ guest }, t)
   }
+
   async period(t?: Transaction) {
-    const [p] = await this.rows<{ period: string; next: string }>(
-      `SELECT to_char(date_trunc('week',NOW() AT TIME ZONE 'Europe/Moscow'),'YYYY-MM-DD') AS period, (date_trunc('week',NOW() AT TIME ZONE 'Europe/Moscow') + INTERVAL '1 week') AT TIME ZONE 'Europe/Moscow' AS next`,
-      {},
-      t,
-    )
+    const [p] = await this.repository.weekWindow(t)
 
     return p
   }
-  async settings(t?: Transaction) {
-    return (await this.rows<Settings>('SELECT * FROM bonus_settings WHERE id=1', {}, t))[0]
+
+  async settings(t?: Transaction): Promise<Settings> {
+    return (await BonusSettingsModel.findAll({ where: { id: 1 }, transaction: t, raw: true }))[0]
   }
+
   async deposits(user: string, t?: Transaction) {
-    return (
-      await this.rows<{ total: string }>(
-        `SELECT COALESCE(SUM(amount_minor),0)::TEXT total FROM confirmed_deposits WHERE user_id=:user AND reversed_at IS NULL AND confirmed_at>=date_trunc('week',NOW() AT TIME ZONE 'Europe/Moscow') AT TIME ZONE 'Europe/Moscow' AND confirmed_at<=NOW()`,
-        { user },
-        t,
-      )
-    )[0].total
+    return (await this.repository.weeklyDeposits({ user }, t))[0].total
   }
+
   publicDraw(d?: Draw) {
     return d
       ? {
@@ -116,6 +88,7 @@ export class BonusService {
         }
       : null
   }
+
   async status(user: string | null, guest: string) {
     // Reconcile expired packages without requiring another paid game.
     if (user) {
@@ -129,27 +102,28 @@ export class BonusService {
 
     const period = await this.period()
 
-    const draws = await this.rows<Draw>(
-      user
-        ? `SELECT * FROM bonus_draws WHERE user_id=:user AND (mode='welcome' OR period=:period)`
-        : 'SELECT * FROM bonus_draws WHERE guest_hash=:guest AND user_id IS NULL',
-      { user, guest, period: period.period },
-    )
+    const draws = await BonusDrawsModel.findAll({
+      where: user
+        ? { user_id: user, [Op.or]: [{ mode: 'welcome' }, { period: period.period }] }
+        : { guest_hash: guest, user_id: null },
+      raw: true,
+    })
 
     const guestClaimed =
       !user &&
       (
-        await this.rows<{ used: boolean }>(
-          'SELECT EXISTS(SELECT 1 FROM bonus_draws WHERE guest_hash=:guest AND user_id IS NOT NULL) AS used',
-          { guest },
-        )
+        await BonusDrawsModel.count({
+          where: { guest_hash: guest, user_id: { [Op.ne]: null } },
+        }).then((count) => [{ used: count > 0 }])
       )[0].used
 
     const [wallet] = user
-      ? await this.rows<{ balance: string; version: number }>(
-          'SELECT balance,version FROM dice_wallets WHERE user_id=:user',
-          { user },
-        )
+      ? await DiceWallet.findAll({
+          attributes: ['balance', 'version'],
+          where: { userId: user },
+          transaction: undefined,
+          raw: true,
+        })
       : []
 
     return {
@@ -166,12 +140,17 @@ export class BonusService {
       grants: user ? await this.grants(user) : [],
     }
   }
+
   async grants(user: string, t?: Transaction): Promise<BonusGrant[]> {
-    const grants = await this.rows<Grant>(
-      'SELECT * FROM bonus_grants WHERE user_id=:user ORDER BY created_at,id',
-      { user },
-      t,
-    )
+    const grants = await BonusGrantsModel.findAll({
+      where: { user_id: user },
+      order: [
+        ['created_at', 'ASC'],
+        ['id', 'ASC'],
+      ],
+      transaction: t,
+      raw: true,
+    })
 
     return grants.map((g) => ({
       id: g.id,
@@ -188,6 +167,7 @@ export class BonusService {
       released: g.released,
     }))
   }
+
   async spin(user: string | null, guest: string, mode: 'welcome' | 'weekly') {
     return this.db.transaction(async (t) => {
       if (user) {
@@ -202,13 +182,11 @@ export class BonusService {
 
       const period = mode === 'welcome' ? 'welcome' : (await this.period(t)).period
 
-      const [old] = await this.rows<Draw>(
-        user
-          ? 'SELECT * FROM bonus_draws WHERE user_id=:user AND mode=:mode AND period=:period'
-          : 'SELECT * FROM bonus_draws WHERE guest_hash=:guest',
-        { user, guest, mode, period },
-        t,
-      )
+      const old = await BonusDrawsModel.findOne({
+        where: user ? { user_id: user, mode, period } : { guest_hash: guest },
+        transaction: t,
+        raw: true,
+      })
 
       if (old) {
         if (!user && old.user_id) {
@@ -231,25 +209,27 @@ export class BonusService {
 
       const prize = BONUS_PRIZES[index]
 
-      const [draw] = await this.rows<Draw>(
-        `INSERT INTO bonus_draws(id,user_id,guest_hash,mode,period,prize_index,game,rounds,stake,wager_multiplier,round_days) VALUES(:id,:user,:guest,:mode,:period,:index,:game,:rounds,:stake,:multiplier,:days) RETURNING *`,
+      const [draw] = await BonusDrawsModel.create(
         {
           id: randomUUID(),
-          user,
-          guest: user ? null : guest,
+          user_id: user,
+          guest_hash: user ? null : guest,
           mode,
           period,
-          index,
-          ...prize,
-          multiplier: settings.wager_multiplier,
-          days: settings.round_days,
+          prize_index: index,
+          game: prize.game,
+          rounds: prize.rounds,
+          stake: prize.stake,
+          wager_multiplier: settings.wager_multiplier,
+          round_days: settings.round_days,
         },
-        t,
-      )
+        { transaction: t },
+      ).then((row) => [row.get({ plain: true })])
 
       return this.publicDraw(draw)
     })
   }
+
   async bindGuest(user: string, guest: string | undefined, t: Transaction) {
     if (!guest) {
       return
@@ -257,29 +237,28 @@ export class BonusService {
 
     await this.guestLock(guest, t)
 
-    const [draw] = await this.rows<Draw>(
-      'SELECT * FROM bonus_draws WHERE guest_hash=:guest FOR UPDATE',
-      { guest },
-      t,
-    )
+    const draw = await BonusDrawsModel.findOne({
+      where: { guest_hash: guest },
+      transaction: t,
+      lock: Transaction.LOCK.UPDATE,
+      raw: true,
+    })
 
     if (!draw || draw.user_id) {
       return
     }
 
-    await this.rows(
-      'UPDATE bonus_draws SET user_id=:user WHERE id=:id RETURNING id',
-      { user, id: draw.id },
-      t,
-    )
+    await BonusDrawsModel.update({ user_id: user }, { where: { id: draw.id }, transaction: t })
     await this.grant(user, draw.id, t)
   }
+
   async grant(user: string, id: string, t: Transaction) {
-    const [d] = await this.rows<Draw>(
-      'SELECT * FROM bonus_draws WHERE id=:id AND user_id=:user FOR UPDATE',
-      { id, user },
-      t,
-    )
+    const d = await BonusDrawsModel.findOne({
+      where: { id: id, user_id: user },
+      transaction: t,
+      lock: Transaction.LOCK.UPDATE,
+      raw: true,
+    })
 
     if (!d) {
       throw new ForbiddenException('Приз не найден.')
@@ -289,8 +268,7 @@ export class BonusService {
       return
     }
 
-    await this.rows(
-      `INSERT INTO bonus_grants(id,user_id,game,stake,remaining,expires_at,wager_multiplier) VALUES(:id,:user,:game,:stake,:rounds,NOW() + CAST(:days AS INTEGER) * INTERVAL '1 day',:multiplier) RETURNING id`,
+    await this.repository.createGrant(
       {
         id,
         user,
@@ -302,14 +280,19 @@ export class BonusService {
       },
       t,
     )
-    await this.rows('UPDATE bonus_draws SET claimed_at=NOW() WHERE id=:id RETURNING id', { id }, t)
+    await BonusDrawsModel.update(
+      { claimed_at: literal('NOW()') },
+      { where: { id: id }, transaction: t },
+    )
   }
+
   async claim(user: string, id: string) {
     await this.db.transaction(async (t) => {
       await this.lock(user, t)
       await this.grant(user, id, t)
     })
   }
+
   async consume(
     user: string,
     id: string,
@@ -319,125 +302,123 @@ export class BonusService {
     source: 'dice' | 'original',
     t: Transaction,
   ) {
-    const [g] = await this.rows<Grant>(
-      'SELECT * FROM bonus_grants WHERE id=:id AND user_id=:user AND expires_at>NOW() AND remaining>0 AND NOT released FOR UPDATE',
-      { id, user },
-      t,
-    )
+    const g = await BonusGrantsModel.findOne({
+      where: {
+        [Op.and]: [
+          { id: id },
+          { user_id: user },
+          { expires_at: { [Op.gt]: literal('NOW()') } },
+          { remaining: { [Op.gt]: 0 } },
+          { released: false },
+        ],
+      },
+      transaction: t,
+      lock: Transaction.LOCK.UPDATE,
+      raw: true,
+    })
 
     if (!g || g.game !== game || g.stake !== stake) {
       throw new DiceError('VALIDATION_ERROR', 'Бесплатный раунд недоступен или ставка изменена.')
     }
 
-    await this.rows(
-      'UPDATE bonus_grants SET remaining=remaining-1 WHERE id=:id RETURNING id',
-      { id },
-      t,
+    await BonusGrantsModel.update(
+      { remaining: literal('"remaining"-1') },
+      { where: { id: id }, transaction: t },
     )
-    await this.rows(
-      'INSERT INTO bonus_rounds(round_id,grant_id,user_id,source) VALUES(:round,:id,:user,:source) RETURNING round_id',
-      { round, id, user, source },
-      t,
+    await BonusRoundsModel.create(
+      { round_id: round, grant_id: id, user_id: user, source: source },
+      { transaction: t },
     )
   }
+
   async consumeBalance(user: string, id: string, stake: string, round: string, t: Transaction) {
-    const [g] = await this.rows<Grant>(
-      'SELECT * FROM bonus_grants WHERE id=:id AND user_id=:user AND NOT released FOR UPDATE',
-      { id, user },
-      t,
-    )
+    const g = await BonusGrantsModel.findOne({
+      where: { id: id, user_id: user, released: false },
+      transaction: t,
+      lock: Transaction.LOCK.UPDATE,
+      raw: true,
+    })
 
     if (!g || BigInt(g.balance) < BigInt(stake)) {
       throw new DiceError('INSUFFICIENT_FUNDS', 'Недостаточно средств на бонусном балансе.')
     }
 
-    await this.rows(
-      'UPDATE bonus_grants SET balance=balance-CAST(:stake AS BIGINT) WHERE id=:id RETURNING id',
-      { id, stake },
-      t,
-    )
-    await this.rows(
-      'INSERT INTO bonus_bets(round_id,grant_id,user_id,stake) VALUES(:round,:id,:user,:stake) RETURNING round_id',
-      { round, id, user, stake },
-      t,
+    await this.repository.debitGrant({ id, stake }, t)
+    await BonusBetsModel.create(
+      { round_id: round, grant_id: id, user_id: user, stake: stake },
+      { transaction: t },
     )
   }
+
   async award(user: string, round: string, amount: string, t: Transaction) {
-    const [bet] = await this.rows<{ grant_id: string }>(
-      'SELECT grant_id FROM bonus_bets WHERE round_id=:round AND user_id=:user',
-      { round, user },
-      t,
-    )
+    const bet = await BonusBetsModel.findOne({
+      attributes: ['grant_id'],
+      where: { round_id: round, user_id: user },
+      transaction: t,
+      raw: true,
+    })
 
     if (bet) {
-      await this.rows(
-        'UPDATE bonus_bets SET won_minor=won_minor+CAST(:amount AS BIGINT) WHERE round_id=:round RETURNING round_id',
-        { round, amount },
-        t,
-      )
-      await this.rows(
-        'UPDATE bonus_grants SET balance=balance+CAST(:amount AS BIGINT) WHERE id=:id RETURNING id',
-        { id: bet.grant_id, amount },
-        t,
-      )
+      await this.repository.creditBonusBet({ round, amount }, t)
+      await this.repository.creditGrantBalance({ id: bet.grant_id, amount }, t)
 
       return true
     }
 
-    const [r] = await this.rows<{ grant_id: string }>(
-      'SELECT grant_id FROM bonus_rounds WHERE round_id=:round AND user_id=:user',
-      { round, user },
-      t,
-    )
+    const r = await BonusRoundsModel.findOne({
+      attributes: ['grant_id'],
+      where: { round_id: round, user_id: user },
+      transaction: t,
+      raw: true,
+    })
 
     if (!r) {
       return false
     }
 
-    await this.rows(
-      'UPDATE bonus_rounds SET won_minor=won_minor+CAST(:amount AS BIGINT) WHERE round_id=:round RETURNING round_id',
-      { round, amount },
-      t,
-    )
-    await this.rows(
-      'UPDATE bonus_grants SET balance=balance+CAST(:amount AS BIGINT),winnings=winnings+CAST(:amount AS BIGINT),required=CEIL((winnings+CAST(:amount AS BIGINT))*wager_multiplier) WHERE id=:id RETURNING id',
-      { id: r.grant_id, amount },
-      t,
-    )
+    await this.repository.creditBonusRound({ round, amount }, t)
+    await this.repository.creditGrantAndRequirement({ id: r.grant_id, amount }, t)
 
     return true
   }
+
   async settled(user: string, round: string, source: 'dice' | 'original', t: Transaction) {
-    const [bet] = await this.rows<{ grant_id: string; stake: string }>(
-      'UPDATE bonus_bets SET settled=TRUE WHERE round_id=:round AND user_id=:user AND NOT settled RETURNING grant_id,stake',
-      { round, user },
-      t,
-    )
+    const [bet] = await BonusBetsModel.update(
+      { settled: true },
+      {
+        where: { round_id: round, user_id: user, settled: false },
+        transaction: t,
+        returning: true,
+      },
+    ).then(([, rows]) => rows.map((row) => row.get({ plain: true })))
 
     if (bet) {
-      await this.rows(
-        'UPDATE bonus_grants SET wagered=LEAST(required,wagered+CAST(:stake AS BIGINT)) WHERE id=:id RETURNING id',
-        { id: bet.grant_id, stake: bet.stake },
-        t,
-      )
+      await this.repository.applyCappedTurnover({ id: bet.grant_id, stake: bet.stake }, t)
     }
 
-    const free = await this.rows(
-      'UPDATE bonus_rounds SET settled=TRUE WHERE round_id=:round AND user_id=:user RETURNING round_id',
-      { round, user },
-      t,
-    )
+    const free = await BonusRoundsModel.update(
+      { settled: true },
+      {
+        where: { round_id: round, user_id: user },
+        transaction: t,
+        returning: true,
+      },
+    ).then(([, rows]) => rows.map((row) => row.get({ plain: true })))
 
     if (!free.length) {
-      const [stake] = await this.rows<{ delta: string }>(
-        `SELECT delta FROM dice_entries WHERE user_id=:user AND ${source === 'dice' ? 'round_id' : 'game_round_id'}=:round AND reason='STAKE'`,
-        { user, round },
-        t,
-      )
+      const stake = await DiceEntry.findOne({
+        attributes: ['delta'],
+        where: {
+          userId: user,
+          [source === 'dice' ? 'roundId' : 'gameRoundId']: round,
+          reason: 'STAKE',
+        },
+        transaction: t,
+        raw: true,
+      })
 
       if (stake) {
-        const added = await this.rows(
-          'INSERT INTO bonus_turnover(round_id,user_id,stake) VALUES(:round,:user,:stake) ON CONFLICT DO NOTHING RETURNING round_id',
+        const added = await this.repository.claimTurnover(
           { round, user, stake: (-BigInt(stake.delta)).toString() },
           t,
         )
@@ -445,11 +426,16 @@ export class BonusService {
         if (added.length) {
           let left = -BigInt(stake.delta)
 
-          const grants = await this.rows<Grant>(
-            'SELECT * FROM bonus_grants WHERE user_id=:user AND NOT released AND required>wagered ORDER BY created_at,id FOR UPDATE',
-            { user },
-            t,
-          )
+          const grants = await BonusGrantsModel.findAll({
+            where: { user_id: user, released: false, required: { [Op.gt]: col('wagered') } },
+            order: [
+              ['created_at', 'ASC'],
+              ['id', 'ASC'],
+            ],
+            transaction: t,
+            lock: Transaction.LOCK.UPDATE,
+            raw: true,
+          })
 
           for (const g of grants) {
             const need = BigInt(g.required) - BigInt(g.wagered)
@@ -460,11 +446,7 @@ export class BonusService {
               break
             }
 
-            await this.rows(
-              'UPDATE bonus_grants SET wagered=wagered+CAST(:add AS BIGINT) WHERE id=:id RETURNING id',
-              { id: g.id, add: add.toString() },
-              t,
-            )
+            await this.repository.applyTurnover({ id: g.id, add: add.toString() }, t)
             left -= add
           }
         }
@@ -473,42 +455,34 @@ export class BonusService {
 
     await this.release(user, t)
   }
+
   async release(user: string, t: Transaction) {
-    const grants = await this.rows<Grant>(
-      `SELECT * FROM bonus_grants g WHERE user_id=:user AND NOT released AND required<=wagered AND (remaining=0 OR expires_at<=NOW()) AND NOT EXISTS(SELECT 1 FROM bonus_rounds r WHERE r.grant_id=g.id AND NOT settled) AND NOT EXISTS(SELECT 1 FROM bonus_bets b WHERE b.grant_id=g.id AND NOT b.settled) FOR UPDATE`,
-      { user },
-      t,
-    )
+    const grants = await this.repository.lockReleasableGrants({ user }, t)
 
     for (const g of grants) {
       if (BigInt(g.balance) > 0n) {
-        const [w] = await this.rows<{ balance: string }>(
-          'UPDATE dice_wallets SET balance=balance+CAST(:amount AS BIGINT),version=version+1 WHERE user_id=:user RETURNING balance',
-          { user, amount: g.balance },
-          t,
-        )
+        const [w] = await this.repository.creditWallet({ user, amount: g.balance }, t)
 
         if (!w) {
           continue
         }
 
-        await this.rows(
-          `INSERT INTO dice_entries(id,user_id,reason,delta,balance_after,bonus_grant_id) VALUES(:id,:user,'BONUS_RELEASE',:amount,:balance,:grant) RETURNING id`,
+        await DiceEntry.create(
           {
             id: randomUUID(),
-            user,
-            amount: g.balance,
-            balance: w.balance,
-            grant: g.id,
+            userId: user,
+            reason: 'BONUS_RELEASE',
+            delta: g.balance,
+            balanceAfter: w.balance,
+            bonusGrantId: g.id,
           },
-          t,
+          { transaction: t },
         )
       }
 
-      await this.rows(
-        'UPDATE bonus_grants SET released=TRUE,released_amount=balance,balance=0 WHERE id=:id RETURNING id',
-        { id: g.id },
-        t,
+      await BonusGrantsModel.update(
+        { released: true, released_amount: col('balance'), balance: '0' },
+        { where: { id: g.id }, transaction: t },
       )
     }
   }

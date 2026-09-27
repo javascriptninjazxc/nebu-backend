@@ -1,44 +1,37 @@
-import { BonusService } from '../bonuses/bonus.service.js'
-import { InjectModel } from '@nestjs/sequelize'
-import { DiceWallet, DiceEntry } from '../dice/models.js'
 import { Inject, Injectable } from '@nestjs/common'
+import { InjectModel } from '@nestjs/sequelize'
+import { randomBytes, randomUUID } from 'node:crypto'
+import { literal, Op, Transaction } from 'sequelize'
 import { Sequelize } from 'sequelize-typescript'
-import { QueryTypes, type Transaction } from 'sequelize'
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { AuthSession } from '../auth/models.js'
+import { digest as hash } from '../auth/password.utils.js'
+import { BonusService } from '../bonuses/bonus.service.js'
+import { DiceConnectionsModel } from '../dice/dice-connections.model.js'
+import { DiceLimitsModel } from '../dice/dice-limits.model.js'
+import { DiceTicketsModel } from '../dice/dice-tickets.model.js'
 import { DiceError } from '../dice/errors.js'
-
-const hash = (s: string) => createHash('sha256').update(s).digest('hex')
-
-type Wallet = { balance: string; version: number }
-
-export type Identity = { userId: string; sessionHash: string }
+import { DiceEntry, DiceWallet } from '../dice/models.js'
+import { GameAccountRepository } from './account.repository.js'
+import type { Identity, Wallet } from './account.types.js'
 
 @Injectable()
 export class GameAccountService {
   constructor(
+    @Inject(GameAccountRepository) private readonly repository: GameAccountRepository,
     @Inject(BonusService) readonly bonuses: BonusService,
     @Inject(Sequelize) readonly db: Sequelize,
     @InjectModel(DiceWallet) private readonly wallets: typeof DiceWallet,
     @InjectModel(DiceEntry) private readonly entries: typeof DiceEntry,
   ) {}
-  rows<T extends object>(
-    sql: string,
-    replacements: Record<string, unknown> = {},
-    transaction?: Transaction,
-  ): Promise<T[]> {
-    return this.db.query<T>(sql, {
-      replacements,
-      transaction,
-      type: QueryTypes.SELECT,
-    })
-  }
+
   async session(sessionHash: string, t?: Transaction): Promise<Identity> {
-    const [s] = await this.rows<{ userId: string }>(
-      'SELECT "userId" FROM auth_sessions WHERE hash=:sessionHash AND "expiresAt">NOW()' +
-        (t ? ' FOR SHARE' : ''),
-      { sessionHash },
-      t,
-    )
+    const s = await AuthSession.findOne({
+      attributes: ['userId'],
+      where: { hash: sessionHash, expiresAt: { [Op.gt]: literal('NOW()') } },
+      transaction: t,
+      lock: t ? Transaction.LOCK.SHARE : undefined,
+      raw: true,
+    })
 
     if (!s) {
       throw new DiceError('UNAUTHENTICATED', 'Войди в аккаунт заново.')
@@ -46,11 +39,9 @@ export class GameAccountService {
 
     return { userId: s.userId, sessionHash }
   }
+
   async limit(key: string, max: number, seconds: number, transaction?: Transaction) {
-    const [row] = await this.rows<{ count: number }>(
-      `INSERT INTO dice_limits(key,count,expires_at) VALUES(:key,1,NOW() + :seconds * INTERVAL '1 second')
-ON CONFLICT(key) DO UPDATE SET count=CASE WHEN dice_limits.expires_at<=NOW() THEN 1 ELSE dice_limits.count+1 END,
-expires_at=CASE WHEN dice_limits.expires_at<=NOW() THEN EXCLUDED.expires_at ELSE dice_limits.expires_at END RETURNING count`,
+    const [row] = await this.repository.incrementActionLimit(
       { key: hash(key), seconds },
       transaction,
     )
@@ -59,6 +50,7 @@ expires_at=CASE WHEN dice_limits.expires_at<=NOW() THEN EXCLUDED.expires_at ELSE
       throw new DiceError('RATE_LIMITED', 'Слишком много действий. Попробуй чуть позже.', true)
     }
   }
+
   async ticket(token: string) {
     if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
       throw new DiceError('UNAUTHENTICATED', 'Войди в аккаунт.')
@@ -71,26 +63,22 @@ expires_at=CASE WHEN dice_limits.expires_at<=NOW() THEN EXCLUDED.expires_at ELSE
 
       const ticket = randomBytes(32).toString('base64url')
 
-      await this.rows(
-        "INSERT INTO dice_tickets(hash,session_hash,expires_at) VALUES(:hash,:session,NOW()+INTERVAL '30 seconds') RETURNING hash",
-        { hash: hash(ticket), session: identity.sessionHash },
-        t,
+      await DiceTicketsModel.create(
+        { hash: hash(ticket), session_hash: identity.sessionHash },
+        { transaction: t },
       )
 
       return { ticket, expiresIn: 30 }
     })
   }
+
   async connect(ticket: unknown, id: string): Promise<Identity> {
     if (typeof ticket !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(ticket)) {
       throw new DiceError('UNAUTHENTICATED', 'Неверный билет.')
     }
 
     return this.db.transaction(async (t) => {
-      const [row] = await this.rows<{ session_hash: string }>(
-        'DELETE FROM dice_tickets WHERE hash=:hash AND expires_at>NOW() RETURNING session_hash',
-        { hash: hash(ticket) },
-        t,
-      )
+      const [row] = await this.repository.consumeTicket({ hash: hash(ticket) }, t)
 
       if (!row) {
         throw new DiceError('UNAUTHENTICATED', 'Билет истёк.')
@@ -98,60 +86,65 @@ expires_at=CASE WHEN dice_limits.expires_at<=NOW() THEN EXCLUDED.expires_at ELSE
 
       const who = await this.session(row.session_hash, t)
 
-      await this.rows(
-        'SELECT pg_advisory_xact_lock(hashtextextended(:user, 70419))',
-        { user: who.userId },
-        t,
-      )
-      await this.rows(
-        'DELETE FROM dice_connections WHERE user_id=:user AND expires_at<=NOW() RETURNING id',
-        { user: who.userId },
-        t,
-      )
+      await this.repository.lockAccount({ user: who.userId }, t)
+      await DiceConnectionsModel.destroy({
+        where: {
+          [Op.and]: [{ user_id: who.userId }, { expires_at: { [Op.lte]: literal('NOW()') } }],
+        },
+        transaction: t,
+      })
 
-      const existing = await this.rows(
-        'SELECT id FROM dice_connections WHERE user_id=:user',
-        { user: who.userId },
-        t,
-      )
+      const existing = await DiceConnectionsModel.findAll({
+        attributes: ['id'],
+        where: { user_id: who.userId },
+        transaction: t,
+        raw: true,
+      })
 
       if (existing.length >= 4) {
         throw new DiceError('RATE_LIMITED', 'Открыто слишком много игровых вкладок.')
       }
 
-      await this.rows(
-        "INSERT INTO dice_connections(id,user_id,session_hash,expires_at) VALUES(:id,:user,:session,NOW()+INTERVAL '90 seconds') RETURNING id",
-        { id, user: who.userId, session: who.sessionHash },
-        t,
+      await DiceConnectionsModel.create(
+        { id, user_id: who.userId, session_hash: who.sessionHash },
+        { transaction: t },
       )
 
       return who
     })
   }
+
   async heartbeat(id: string, identity: Identity) {
     await this.session(identity.sessionHash)
 
-    const rows = await this.rows(
-      "UPDATE dice_connections SET expires_at=NOW()+INTERVAL '90 seconds' WHERE id=:id AND expires_at>NOW() RETURNING id",
-      { id },
-    )
+    const rows = await DiceConnectionsModel.update(
+      { expires_at: literal("NOW() + INTERVAL '90 seconds'") },
+      { where: { id, expires_at: { [Op.gt]: literal('NOW()') } }, returning: true },
+    ).then(([, rows]) => rows)
 
     if (!rows.length) {
       throw new DiceError('UNAUTHENTICATED', 'Соединение истекло.')
     }
   }
+
   async disconnect(id: string) {
-    await this.rows('DELETE FROM dice_connections WHERE id=:id RETURNING id', {
-      id,
+    await DiceConnectionsModel.destroy({ where: { id: id }, transaction: undefined })
+  }
+
+  async cleanup() {
+    await DiceConnectionsModel.destroy({
+      where: { expires_at: { [Op.lt]: literal('NOW()') } },
+      transaction: undefined,
+    })
+    await DiceTicketsModel.destroy({
+      where: { expires_at: { [Op.lt]: literal('NOW()') } },
+      transaction: undefined,
+    })
+    await DiceLimitsModel.destroy({
+      where: { expires_at: { [Op.lt]: literal("NOW() - INTERVAL '1 hour'") } },
     })
   }
-  async cleanup() {
-    await this.rows('DELETE FROM dice_connections WHERE expires_at<NOW() RETURNING id')
-    await this.rows('DELETE FROM dice_tickets WHERE expires_at<NOW() RETURNING hash')
-    await this.rows(
-      "DELETE FROM dice_limits WHERE expires_at<NOW()-INTERVAL '1 hour' RETURNING key",
-    )
-  }
+
   async wallet(user: string, t: Transaction): Promise<Wallet> {
     let wallet = await this.wallets.findByPk(user, {
       transaction: t,
@@ -167,6 +160,7 @@ expires_at=CASE WHEN dice_limits.expires_at<=NOW() THEN EXCLUDED.expires_at ELSE
 
     return { balance: String(wallet.balance), version: wallet.version }
   }
+
   async money(
     user: string,
     round: string,
@@ -183,11 +177,7 @@ expires_at=CASE WHEN dice_limits.expires_at<=NOW() THEN EXCLUDED.expires_at ELSE
       return
     }
 
-    const [w] = await this.rows<Wallet>(
-      'UPDATE dice_wallets SET balance=balance+CAST(:delta AS BIGINT),version=version+1 WHERE user_id=:user RETURNING balance,version',
-      { user, delta },
-      t,
-    )
+    const [w] = await this.repository.creditWallet({ user, delta }, t)
 
     await this.entries.create(
       {

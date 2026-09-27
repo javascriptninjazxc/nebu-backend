@@ -1,34 +1,34 @@
-import type { OnModuleInit, OnModuleDestroy } from '@nestjs/common'
+import type { OnModuleDestroy, OnModuleInit } from '@nestjs/common'
 import { Inject, Injectable, Logger } from '@nestjs/common'
-import type { Transaction } from 'sequelize'
 import { randomUUID } from 'node:crypto'
-import { GameAccountService } from './account.service.js'
-import { OriginalsRandom, periodWindow } from './random.js'
+import { literal, Op, Transaction } from 'sequelize'
 import { DiceError } from '../dice/errors.js'
+import { DiceWallet } from '../dice/models.js'
+import { GameAccountService } from './account.service.js'
+import type { JackpotDraw, NetworkState } from './contracts.js'
 import type { DrawDto, DrawRevealDto } from './dto.js'
-import type { JackpotDraw, NetworkState, PoolId } from './contracts.js'
-
-type Period = {
-  id: string
-  pool: PoolId
-  amount: string
-  total_weight: string
-  winner_id: string | null
-  paid: boolean
-  ends_at: Date
-  status: 'OPEN' | 'DRAWN' | 'EMPTY'
-}
-type Participation = Period & { opened: number; version: number }
+import { JackpotContributionsModel } from './jackpot-contributions.model.js'
+import { JackpotOutboxModel } from './jackpot-outbox.model.js'
+import { JackpotParticipantsModel } from './jackpot-participants.model.js'
+import { JackpotPeriodsModel } from './jackpot-periods.model.js'
+import { NetworkJackpotsRepository } from './network-jackpots.repository.js'
+import type { Participation } from './network-jackpots.types.js'
+import { OriginalsRandom, periodWindow } from './random.js'
 
 @Injectable()
 export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
   constructor(
+    @Inject(NetworkJackpotsRepository) private readonly repository: NetworkJackpotsRepository,
     @Inject(GameAccountService) private readonly accounts: GameAccountService,
     @Inject(OriginalsRandom) private readonly random: OriginalsRandom,
   ) {}
+
   private timer?: ReturnType<typeof setInterval>
+
   private running = false
+
   private logger = new Logger(NetworkJackpotsService.name)
+
   onModuleInit() {
     this.timer = setInterval(() => {
       void this.tick()
@@ -36,11 +36,13 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
     this.timer.unref()
     void this.tick()
   }
+
   onModuleDestroy() {
     if (this.timer) {
       clearInterval(this.timer)
     }
   }
+
   private async tick() {
     if (this.running) {
       return
@@ -56,18 +58,16 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
       this.running = false
     }
   }
+
   async now(t: Transaction) {
-    const [clock] = await this.accounts.rows<{ now: Date }>(
-      'SELECT clock_timestamp() AS now',
-      {},
-      t,
-    )
+    const [clock] = await this.repository.clock(t)
 
     return new Date(clock.now)
   }
+
   async contribute(user: string, round: string, stake: string, t: Transaction) {
     // One short global schedule lock gives both pools the same acceptance time and prevents closing across a contribution.
-    await this.accounts.rows('SELECT pg_advisory_xact_lock(70419002)', {}, t)
+    await this.repository.lockSchedule(t)
 
     const now = await this.now(t)
 
@@ -76,70 +76,67 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
 
       const contribution = (BigInt(stake) / 100n).toString()
 
-      const [period] = await this.accounts.rows<{ id: string }>(
-        `INSERT INTO jackpot_periods(id,pool,starts_at,ends_at) VALUES(:id,:pool,:start,:end)
-  ON CONFLICT(pool,starts_at) DO UPDATE SET pool=EXCLUDED.pool RETURNING id`,
+      const [period] = await this.repository.ensurePeriod(
         { id: randomUUID(), pool, start: window.start, end: window.end },
         t,
       )
 
-      await this.accounts.rows(
-        'INSERT INTO jackpot_contributions(round_id,period_id,user_id,amount,weight) VALUES(:round,:period,:user,:amount,:stake) RETURNING round_id',
-        { round, period: period.id, user, amount: contribution, stake },
-        t,
+      await JackpotContributionsModel.create(
+        {
+          round_id: round,
+          period_id: period.id,
+          user_id: user,
+          amount: contribution,
+          weight: stake,
+        },
+        { transaction: t },
       )
-      await this.accounts.rows(
-        "UPDATE jackpot_periods SET amount=amount+CAST(:amount AS BIGINT),total_weight=total_weight+CAST(:stake AS BIGINT) WHERE id=:id AND status='OPEN' RETURNING id",
-        { id: period.id, amount: contribution, stake },
-        t,
-      )
-      await this.accounts.rows(
-        `INSERT INTO jackpot_participants(period_id,user_id,weight) VALUES(:period,:user,:stake)
-  ON CONFLICT(period_id,user_id) DO UPDATE SET weight=jackpot_participants.weight+EXCLUDED.weight RETURNING user_id`,
-        { period: period.id, user, stake },
-        t,
-      )
+      await this.repository.contributeToPeriod({ id: period.id, amount: contribution, stake }, t)
+      await this.repository.contributeToParticipant({ period: period.id, user, stake }, t)
     }
   }
+
   async settleDue() {
     return this.accounts.db.transaction(async (t) => {
-      await this.accounts.rows("SET LOCAL lock_timeout='3s'", {}, t)
-      await this.accounts.rows("SET LOCAL statement_timeout='5s'", {}, t)
+      await this.repository.setLockTimeout(t)
+      await this.repository.setStatementTimeout(t)
 
-      const [lock] = await this.accounts.rows<{ locked: boolean }>(
-        'SELECT pg_try_advisory_xact_lock(70419002) AS locked',
-        {},
-        t,
-      )
+      const [lock] = await this.repository.tryLockSchedule(t)
 
       if (!lock.locked) {
         return 0
       }
 
-      const due = await this.accounts.rows<Period>(
-        "SELECT * FROM jackpot_periods WHERE status='OPEN' AND ends_at<=clock_timestamp() ORDER BY ends_at,id LIMIT 100 FOR UPDATE",
-        {},
-        t,
-      )
+      const due = await JackpotPeriodsModel.findAll({
+        where: {
+          [Op.and]: [{ status: 'OPEN' }, { ends_at: { [Op.lte]: literal('clock_timestamp()') } }],
+        },
+        order: [
+          ['ends_at', 'ASC'],
+          ['id', 'ASC'],
+        ],
+        limit: 100,
+        transaction: t,
+        lock: Transaction.LOCK.UPDATE,
+        raw: true,
+      })
 
       for (const period of due) {
         if (BigInt(period.total_weight) === 0n) {
-          await this.accounts.rows(
-            "UPDATE jackpot_periods SET status='EMPTY',drawn_at=NOW() WHERE id=:id RETURNING id",
-            { id: period.id },
-            t,
+          await JackpotPeriodsModel.update(
+            { status: 'EMPTY', drawn_at: literal('NOW()') },
+            { where: { id: period.id }, transaction: t },
           )
           continue
         }
 
-        const participants = await this.accounts.rows<{
-          user_id: string
-          weight: string
-        }>(
-          'SELECT user_id,weight FROM jackpot_participants WHERE period_id=:id ORDER BY user_id',
-          { id: period.id },
-          t,
-        )
+        const participants = await JackpotParticipantsModel.findAll({
+          attributes: ['user_id', 'weight'],
+          where: { period_id: period.id },
+          order: [['user_id', 'ASC']],
+          transaction: t,
+          raw: true,
+        })
 
         const total = participants.reduce((sum, p) => sum + BigInt(p.weight), 0n)
 
@@ -164,39 +161,40 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
           throw new Error('No winner')
         }
 
-        await this.accounts.rows(
-          "UPDATE jackpot_periods SET status='DRAWN',winner_id=:winner,drawn_at=NOW() WHERE id=:id RETURNING id",
-          { id: period.id, winner },
-          t,
+        await JackpotPeriodsModel.update(
+          { status: 'DRAWN', winner_id: winner, drawn_at: literal('NOW()') },
+          { where: { id: period.id }, transaction: t },
         )
-        await this.accounts.rows(
-          'INSERT INTO jackpot_outbox(period_id) VALUES(:id) RETURNING id',
-          { id: period.id },
-          t,
-        )
+        await JackpotOutboxModel.create({ period_id: period.id }, { transaction: t })
       }
 
       return due.length
     })
   }
+
   async notifications(emit: (eventId: string) => void) {
     await this.accounts.db.transaction(async (t) => {
-      const rows = await this.accounts.rows<{ id: string }>(
-        'SELECT id FROM jackpot_outbox WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED',
-        {},
-        t,
-      )
+      const rows = await JackpotOutboxModel.findAll({
+        attributes: ['id'],
+        where: { published_at: null },
+        order: [['id', 'ASC']],
+        limit: 100,
+        transaction: t,
+        lock: Transaction.LOCK.UPDATE,
+        skipLocked: true,
+        raw: true,
+      })
 
       for (const row of rows) {
         emit(row.id)
-        await this.accounts.rows(
-          'UPDATE jackpot_outbox SET published_at=NOW() WHERE id=:id RETURNING id',
-          { id: row.id },
-          t,
+        await JackpotOutboxModel.update(
+          { published_at: literal('NOW()') },
+          { where: { id: row.id }, transaction: t },
         )
       }
     })
   }
+
   private present(p: Participation, user: string): JackpotDraw {
     const winner = p.winner_id === user
 
@@ -215,6 +213,7 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
       result: p.opened !== 7 ? 'pending' : winner ? (p.paid ? 'paid' : 'won') : 'lost',
     }
   }
+
   async view(user: string, t: Transaction, drawId?: string): Promise<NetworkState> {
     const now = await this.now(t)
 
@@ -222,11 +221,12 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
       (['mini', 'mega'] as const).map(async (id) => {
         const window = periodWindow(id, now)
 
-        const [pool] = await this.accounts.rows<{ amount: string }>(
-          'SELECT amount FROM jackpot_periods WHERE pool=:pool AND starts_at=:start',
-          { pool: id, start: window.start },
-          t,
-        )
+        const pool = await JackpotPeriodsModel.findOne({
+          attributes: ['amount'],
+          where: { pool: id, starts_at: window.start },
+          transaction: t,
+          raw: true,
+        })
 
         return {
           id,
@@ -238,21 +238,12 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
     )
 
     // Every participant can reveal the result; only unpaid winners remain after all cards are opened.
-    const rows = await this.accounts.rows<Participation>(
-      `SELECT p.*,j.opened,j.version FROM jackpot_participants j JOIN jackpot_periods p ON p.id=j.period_id
- WHERE j.user_id=:user AND p.status='DRAWN' AND (j.opened<>7 OR (p.winner_id=:user AND NOT p.paid)) ORDER BY p.ends_at,p.id LIMIT 21`,
-      { user },
-      t,
-    )
+    const rows = await this.repository.findPendingDraws({ user }, t)
 
     let draw: JackpotDraw | null = null
 
     if (drawId) {
-      const [row] = await this.accounts.rows<Participation>(
-        "SELECT p.*,j.opened,j.version FROM jackpot_participants j JOIN jackpot_periods p ON p.id=j.period_id WHERE j.user_id=:user AND p.id=:id AND p.status='DRAWN'",
-        { user, id: drawId },
-        t,
-      )
+      const [row] = await this.repository.findDraw({ user, id: drawId }, t)
 
       if (!row) {
         throw new DiceError('DRAW_NOT_FOUND', 'Розыгрыш не найден.')
@@ -261,10 +252,13 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
       draw = this.present(row, user)
     }
 
-    const [wallet] = await this.accounts.rows<{
-      balance: string
-      version: number
-    }>('SELECT balance,version FROM dice_wallets WHERE user_id=:user', { user }, t)
+    const wallet = await DiceWallet.findOne({
+      rejectOnEmpty: true,
+      attributes: ['balance', 'version'],
+      where: { userId: user },
+      transaction: t,
+      raw: true,
+    })
 
     return {
       balanceMinor: wallet.balance,
@@ -276,25 +270,22 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
       draw,
     }
   }
+
   async action(user: string, event: string, dto: DrawDto, t: Transaction) {
-    const [period] = await this.accounts.rows<Period>(
-      "SELECT p.* FROM jackpot_periods p JOIN jackpot_participants j ON j.period_id=p.id WHERE p.id=:id AND j.user_id=:user AND p.status='DRAWN' FOR UPDATE OF p",
-      { id: dto.drawId, user },
-      t,
-    )
+    const [period] = await this.repository.lockParticipantPeriod({ id: dto.drawId, user }, t)
 
     if (!period) {
       throw new DiceError('DRAW_NOT_FOUND', 'Розыгрыш не найден.')
     }
 
-    const [participant] = await this.accounts.rows<{
-      opened: number
-      version: number
-    }>(
-      'SELECT opened,version FROM jackpot_participants WHERE period_id=:id AND user_id=:user FOR UPDATE',
-      { id: dto.drawId, user },
-      t,
-    )
+    const participant = await JackpotParticipantsModel.findOne({
+      rejectOnEmpty: true,
+      attributes: ['opened', 'version'],
+      where: { period_id: dto.drawId, user_id: user },
+      transaction: t,
+      lock: Transaction.LOCK.UPDATE,
+      raw: true,
+    })
 
     if (participant.version !== dto.expectedVersion) {
       throw new DiceError('VERSION_CONFLICT', 'Розыгрыш изменился. Обновляем состояние.')
@@ -307,11 +298,7 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
         throw new DiceError('CELL_ALREADY_OPENED', 'Карта уже открыта.')
       }
 
-      await this.accounts.rows(
-        'UPDATE jackpot_participants SET opened=opened | :bit,version=version+1 WHERE period_id=:id AND user_id=:user RETURNING version',
-        { id: dto.drawId, user, bit: 1 << index },
-        t,
-      )
+      await this.repository.revealCard({ id: dto.drawId, user, bit: 1 << index }, t)
     } else {
       if (participant.opened !== 7) {
         throw new DiceError('CLAIM_NOT_READY', 'Сначала открой три карты.')
@@ -323,15 +310,16 @@ export class NetworkJackpotsService implements OnModuleInit, OnModuleDestroy {
 
       if (!period.paid) {
         await this.accounts.money(user, period.id, period.amount, 'PAYOUT', t, 'jackpot')
-        await this.accounts.rows(
-          'UPDATE jackpot_periods SET paid=TRUE WHERE id=:id RETURNING id',
-          { id: period.id },
-          t,
+        await JackpotPeriodsModel.update(
+          { paid: true },
+          { where: { id: period.id }, transaction: t },
         )
-        await this.accounts.rows(
-          'UPDATE jackpot_participants SET version=version+1 WHERE period_id=:id AND user_id=:user RETURNING version',
-          { id: period.id, user },
-          t,
+        await JackpotParticipantsModel.update(
+          { version: literal('"version"+1') },
+          {
+            where: { period_id: period.id, user_id: user },
+            transaction: t,
+          },
         )
       }
     }

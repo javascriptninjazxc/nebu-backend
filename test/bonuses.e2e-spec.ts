@@ -1,17 +1,20 @@
-import { fundTestWallet } from './fund-wallet.js'
-import { Test } from '@nestjs/testing'
 import type { NestExpressApplication } from '@nestjs/platform-express'
+import { Test } from '@nestjs/testing'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { QueryTypes, type Transaction } from 'sequelize'
 import { AppModule } from '../src/app.module.js'
 import { AuthService } from '../src/auth/auth.service.js'
-import { BonusService, choosePrize, guestDigest } from '../src/bonuses/bonus.service.js'
-import { DiceService, type Identity } from '../src/dice/dice.service.js'
+import { BonusService } from '../src/bonuses/bonus.service.js'
+import { choosePrize, guestDigest } from '../src/bonuses/bonus.utils.js'
+import type { DiceEvent, DiceState } from '../src/dice/contracts.js'
+import { DiceService } from '../src/dice/dice.service.js'
+import { DiceRandom } from '../src/dice/math.js'
+import type { Identity } from '../src/games/account.types.js'
+import type { OriginalsEvent, OriginalState } from '../src/games/contracts.js'
+import { NetworkJackpotsService } from '../src/games/network-jackpots.service.js'
 import { OriginalsService } from '../src/games/originals.service.js'
 import { OriginalsRandom } from '../src/games/random.js'
-import type { OriginalsEvent, OriginalState } from '../src/games/contracts.js'
-import { DiceRandom } from '../src/dice/math.js'
-import type { DiceEvent, DiceState } from '../src/dice/contracts.js'
-import { NetworkJackpotsService } from '../src/games/network-jackpots.service.js'
+import { fundTestWallet } from './fund-wallet.js'
 
 describe('bonus wheel economy', () => {
   let app: NestExpressApplication
@@ -19,6 +22,12 @@ describe('bonus wheel economy', () => {
   let auth: AuthService
 
   let bonus: BonusService
+
+  const rows = <T extends object>(
+    sql: string,
+    replacements: Record<string, unknown> = {},
+    transaction?: Transaction,
+  ): Promise<T[]> => bonus.db.query<T>(sql, { replacements, transaction, type: QueryTypes.SELECT })
 
   let dice: DiceService
 
@@ -78,10 +87,10 @@ describe('bonus wheel economy', () => {
   async function grant(who: Identity, game = 'dice') {
     const d = (await bonus.spin(who.userId, '', 'welcome'))!
 
-    await bonus.rows(
-      'UPDATE bonus_draws SET game=:game,rounds=1,stake=1000 WHERE id=:id RETURNING id',
-      { id: d.id, game },
-    )
+    await rows('UPDATE bonus_draws SET game=:game,rounds=1,stake=1000 WHERE id=:id RETURNING id', {
+      id: d.id,
+      game,
+    })
     await bonus.claim(who.userId, d.id)
 
     return d.id
@@ -102,7 +111,7 @@ describe('bonus wheel economy', () => {
 
   async function record(id: string) {
     return (
-      await bonus.rows<{
+      await rows<{
         remaining: number
         winnings: string
         required: string
@@ -148,12 +157,12 @@ describe('bonus wheel economy', () => {
     const p = await player()
 
     await expect(bonus.spin(p.userId, '', 'weekly')).rejects.toThrow()
-    await bonus.rows(
+    await rows(
       'INSERT INTO confirmed_deposits(id,user_id,amount_minor,confirmed_at) VALUES(:id,:user,99900,NOW()) RETURNING id',
       { id: randomUUID(), user: p.userId },
     )
     await expect(bonus.spin(p.userId, '', 'weekly')).rejects.toThrow()
-    await bonus.rows(
+    await rows(
       'INSERT INTO confirmed_deposits(id,user_id,amount_minor,confirmed_at) VALUES(:id,:user,100,NOW()) RETURNING id',
       { id: randomUUID(), user: p.userId },
     )
@@ -232,7 +241,7 @@ describe('bonus wheel economy', () => {
     s = await command(p, 'dice.sync')
     expect(BigInt(s.balanceMinor)).toBe(BigInt(initial) - paid + won)
     expect(
-      await bonus.rows(
+      await rows(
         "SELECT id FROM dice_entries WHERE bonus_grant_id=:id AND reason='BONUS_RELEASE'",
         { id },
       ),
@@ -259,7 +268,7 @@ describe('bonus wheel economy', () => {
         bonusGrantId: id,
       }),
     ).rejects.toThrow()
-    await bonus.rows(
+    await rows(
       "UPDATE bonus_grants SET expires_at=NOW()-INTERVAL '1 second' WHERE id=:id RETURNING id",
       { id },
     )
@@ -327,7 +336,7 @@ describe('bonus wheel economy', () => {
 
     const initial = (await command(who, 'dice.sync')).balanceMinor
 
-    await bonus.rows(
+    await rows(
       "UPDATE bonus_grants SET balance=30000,winnings=30000,required=60000,wagered=60000,expires_at=NOW()-INTERVAL '1 second' WHERE id=:id RETURNING id",
       { id },
     )
@@ -346,7 +355,7 @@ describe('bonus wheel economy', () => {
     expect((await command(who, 'dice.sync')).balanceMinor).toBe('0')
     await expect(command(who, 'dice.start', { stakeMinor: '1000', mines: 1 })).rejects.toThrow()
     expect(
-      await bonus.rows('SELECT id FROM dice_entries WHERE user_id=:user', { user: who.userId }),
+      await rows('SELECT id FROM dice_entries WHERE user_id=:user', { user: who.userId }),
     ).toHaveLength(0)
 
     const id = await grant(who)
@@ -364,7 +373,7 @@ describe('bonus wheel economy', () => {
 
     const id = await grant(who)
 
-    await bonus.rows(
+    await rows(
       'UPDATE bonus_grants SET remaining=0,winnings=20000,balance=20000,required=40000,wagered=38000 WHERE id=:id RETURNING id',
       { id },
     )
@@ -413,9 +422,9 @@ describe('bonus wheel economy', () => {
       wageredMinor: '40000',
       released: true,
     })
-    expect(
-      await bonus.rows('SELECT id FROM dice_entries WHERE bonus_grant_id=:id', { id }),
-    ).toHaveLength(1)
+    expect(await rows('SELECT id FROM dice_entries WHERE bonus_grant_id=:id', { id })).toHaveLength(
+      1,
+    )
     await expect(
       command(who, 'dice.start', { stakeMinor: '1000', mines: 1, bonusWalletId: id }),
     ).rejects.toThrow()
@@ -427,7 +436,7 @@ describe('bonus wheel economy', () => {
 
     const id = await grant(who)
 
-    await bonus.rows(
+    await rows(
       'UPDATE bonus_grants SET remaining=0,winnings=1000,balance=1000,required=2000 WHERE id=:id RETURNING id',
       { id },
     )

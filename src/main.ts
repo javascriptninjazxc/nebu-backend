@@ -1,12 +1,12 @@
-import 'reflect-metadata'
-import { existsSync } from 'node:fs'
-import { loadEnvFile } from 'node:process'
 import { ConsoleLogger } from '@nestjs/common'
 import { NestFactory } from '@nestjs/core'
 import type { NestExpressApplication } from '@nestjs/platform-express'
+import { existsSync } from 'node:fs'
+import { loadEnvFile } from 'node:process'
+import 'reflect-metadata'
 import { AppModule } from './app.module.js'
-import { readEnvironment } from './config/environment.js'
 import { configureApp } from './config/configure-app.js'
+import { readEnvironment } from './config/environment.js'
 
 if (existsSync('.env')) {
   loadEnvFile('.env')

@@ -1,4 +1,4 @@
-﻿import {
+import {
   Body,
   Controller,
   Get,
@@ -8,40 +8,14 @@
   Post,
   UnauthorizedException,
 } from '@nestjs/common'
-import { IsIn, IsUUID } from 'class-validator'
-import { BonusService, guestDigest } from './bonus.service.js'
-
-class SpinDto {
-  @IsIn(['welcome', 'weekly']) mode!: 'welcome' | 'weekly'
-}
-
-class ClaimDto {
-  @IsUUID('4') id!: string
-}
+import { ClaimDto, SpinDto } from './bonus.dto.js'
+import { BonusService } from './bonus.service.js'
+import { guestDigest } from './bonus.utils.js'
 
 @Controller('bonuses')
 export class BonusController {
   constructor(@Inject(BonusService) private readonly bonus: BonusService) {}
-  private async identity(auth?: string) {
-    if (!auth) {
-      return null
-    }
 
-    if (!/^Bearer [A-Za-z0-9_-]{43}$/.test(auth)) {
-      throw new UnauthorizedException()
-    }
-
-    const [s] = await this.bonus.rows<{ userId: string }>(
-      'SELECT "userId" FROM auth_sessions WHERE hash=:hash AND "expiresAt">NOW()',
-      { hash: guestDigest(auth.slice(7)) },
-    )
-
-    if (!s) {
-      throw new UnauthorizedException()
-    }
-
-    return s.userId
-  }
   private guest(token?: string) {
     if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) {
       throw new UnauthorizedException()
@@ -49,11 +23,13 @@ export class BonusController {
 
     return guestDigest(token)
   }
+
   @Get('status')
   @Header('Cache-Control', 'no-store')
   async status(@Headers('authorization') auth?: string, @Headers('x-bonus-guest') guest?: string) {
-    return this.bonus.status(await this.identity(auth), this.guest(guest))
+    return this.bonus.status(await this.bonus.identity(auth), this.guest(guest))
   }
+
   @Post('spin')
   @Header('Cache-Control', 'no-store')
   async spin(
@@ -61,12 +37,13 @@ export class BonusController {
     @Headers('authorization') auth?: string,
     @Headers('x-bonus-guest') guest?: string,
   ) {
-    return this.bonus.spin(await this.identity(auth), this.guest(guest), body.mode)
+    return this.bonus.spin(await this.bonus.identity(auth), this.guest(guest), body.mode)
   }
+
   @Post('claim')
   @Header('Cache-Control', 'no-store')
   async claim(@Body() body: ClaimDto, @Headers('authorization') auth?: string) {
-    const user = await this.identity(auth)
+    const user = await this.bonus.identity(auth)
 
     if (!user) {
       throw new UnauthorizedException()

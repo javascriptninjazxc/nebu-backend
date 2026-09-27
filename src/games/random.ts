@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common'
-import { randomInt, randomBytes } from 'node:crypto'
+import { randomBytes, randomInt } from 'node:crypto'
 
 export const FOREST_SECTORS = [
   'coin',
@@ -25,12 +25,15 @@ export class OriginalsRandom {
   outer() {
     return randomInt(16)
   }
+
   inner() {
     return randomInt(3)
   }
+
   risk() {
     return randomInt(2) === 0
   }
+
   deck() {
     const cards = [0, 1, 2, 3, 4, 5]
 
@@ -42,6 +45,7 @@ export class OriginalsRandom {
 
     return cards.slice(0, 3).reduce((mask, i) => mask | (1 << i), 0)
   }
+
   weighted(total: bigint) {
     if (total <= 0n) {
       throw new Error('Empty draw')

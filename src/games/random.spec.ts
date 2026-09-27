@@ -1,4 +1,4 @@
-import { cachePay, forestPay, FOREST_SECTORS, OriginalsRandom, periodWindow } from './random.js'
+import { cachePay, FOREST_SECTORS, forestPay, OriginalsRandom, periodWindow } from './random.js'
 
 describe('originals exact economy and schedules', () => {
   it('preserves all three cache multipliers, including fractional-chip payouts', () => {

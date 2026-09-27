@@ -13,6 +13,7 @@ import { DiceError } from './errors.js'
 @Controller('auth')
 export class DiceController {
   constructor(@Inject(DiceService) private readonly dice: DiceService) {}
+
   @Post('ws-ticket')
   @Header('Cache-Control', 'no-store')
   async ticket(@Headers('authorization') authorization?: string) {

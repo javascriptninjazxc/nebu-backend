@@ -1,16 +1,3 @@
-import { OriginalsService } from '../games/originals.service.js'
-import { NetworkJackpotsService } from '../games/network-jackpots.service.js'
-import {
-  ForestStartDto,
-  ChestStartDto,
-  CacheStartDto,
-  CacheRevealDto,
-  ForestSpinDto,
-  DrawDto,
-  DrawRevealDto,
-  JackpotSyncDto,
-} from '../games/dto.js'
-import type { OriginalsEvent, OriginalsReply } from '../games/contracts.js'
 import type { OnModuleDestroy } from '@nestjs/common'
 import { Inject, Logger } from '@nestjs/common'
 import {
@@ -19,18 +6,32 @@ import {
   SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
-  type OnGatewayInit,
-  type OnGatewayDisconnect,
   type OnGatewayConnection,
+  type OnGatewayDisconnect,
+  type OnGatewayInit,
 } from '@nestjs/websockets'
-import type { Namespace, Socket } from 'socket.io'
 import { plainToInstance } from 'class-transformer'
-import { validate, isUUID } from 'class-validator'
-import { DiceService, type Identity } from './dice.service.js'
-import type { CommandDto } from './dto.js'
-import { StartDto, RevealDto, RoundDto, SyncDto, StatusDto } from './dto.js'
-import { DiceError } from './errors.js'
+import { isUUID, validate } from 'class-validator'
+import type { Namespace, Socket } from 'socket.io'
+import type { Identity } from '../games/account.types.js'
+import type { OriginalsEvent, OriginalsReply } from '../games/contracts.js'
+import {
+  CacheRevealDto,
+  CacheStartDto,
+  ChestStartDto,
+  DrawDto,
+  DrawRevealDto,
+  ForestSpinDto,
+  ForestStartDto,
+  JackpotSyncDto,
+} from '../games/dto.js'
+import { NetworkJackpotsService } from '../games/network-jackpots.service.js'
+import { OriginalsService } from '../games/originals.service.js'
 import type { DiceEvent, DiceReply } from './contracts.js'
+import { DiceService } from './dice.service.js'
+import type { CommandDto } from './dto.js'
+import { RevealDto, RoundDto, StartDto, StatusDto, SyncDto } from './dto.js'
+import { DiceError } from './errors.js'
 
 type Client = Socket & {
   data: {
@@ -64,17 +65,24 @@ type Client = Socket & {
 export class DiceGateway
   implements OnGatewayInit, OnGatewayDisconnect, OnGatewayConnection, OnModuleDestroy
 {
-  @WebSocketServer() server!: Namespace
+  @WebSocketServer()
+  server!: Namespace
+
   private timer?: ReturnType<typeof setInterval>
+
   private notifyTimer?: ReturnType<typeof setInterval>
+
   private notifying = false
+
   private logger = new Logger(DiceGateway.name)
+
   constructor(
     @Inject(DiceService) private readonly dice: DiceService,
     @Inject(OriginalsService) private readonly originals: OriginalsService,
     @Inject(NetworkJackpotsService)
     private readonly jackpots: NetworkJackpotsService,
   ) {}
+
   afterInit(server: Namespace) {
     const origins = (
       process.env.DICE_WS_ORIGINS ??
@@ -138,6 +146,7 @@ export class DiceGateway
     }, 2000)
     this.notifyTimer.unref()
   }
+
   handleConnection(client: Client) {
     const events = new Set([
       'dice.start',
@@ -175,6 +184,7 @@ export class DiceGateway
       }
     })
   }
+
   private async maintain(server: Namespace) {
     await Promise.all(
       [...server.sockets.values()].map(async (client: Client) => {
@@ -194,6 +204,7 @@ export class DiceGateway
       this.logger.warn('Dice cleanup unavailable')
     }
   }
+
   onModuleDestroy() {
     if (this.timer) {
       clearInterval(this.timer)
@@ -203,6 +214,7 @@ export class DiceGateway
       clearInterval(this.notifyTimer)
     }
   }
+
   async handleDisconnect(client: Client) {
     try {
       await this.dice.disconnect(client.id)
@@ -210,6 +222,7 @@ export class DiceGateway
       this.logger.warn('Dice lease cleanup deferred')
     }
   }
+
   private async run(
     client: Client,
     event: DiceEvent | OriginalsEvent,
@@ -331,148 +344,139 @@ export class DiceGateway
       }
     }
   }
-  @SubscribeMessage('dice.start') start(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
+
+  @SubscribeMessage('dice.start')
+  start(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'dice.start', p)
   }
-  @SubscribeMessage('dice.reveal') reveal(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
+
+  @SubscribeMessage('dice.reveal')
+  reveal(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'dice.reveal', p)
   }
-  @SubscribeMessage('dice.cashout') cashout(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('dice.cashout')
+  cashout(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'dice.cashout', p)
   }
-  @SubscribeMessage('dice.sync') sync(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
+
+  @SubscribeMessage('dice.sync')
+  sync(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'dice.sync', p)
   }
-  @SubscribeMessage('dice.commandStatus') status(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('dice.commandStatus')
+  status(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'dice.commandStatus', p)
   }
-  @SubscribeMessage('forest.start') original0(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('forest.start')
+  original0(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'forest.start', p)
   }
-  @SubscribeMessage('forest.open') original1(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('forest.open')
+  original1(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'forest.open', p)
   }
-  @SubscribeMessage('forest.charge') original2(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('forest.charge')
+  original2(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'forest.charge', p)
   }
-  @SubscribeMessage('forest.spin') original3(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('forest.spin')
+  original3(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'forest.spin', p)
   }
-  @SubscribeMessage('forest.risk') original4(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('forest.risk')
+  original4(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'forest.risk', p)
   }
-  @SubscribeMessage('forest.cashout') original5(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('forest.cashout')
+  original5(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'forest.cashout', p)
   }
-  @SubscribeMessage('forest.sync') original6(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('forest.sync')
+  original6(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'forest.sync', p)
   }
-  @SubscribeMessage('forest.commandStatus') original7(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('forest.commandStatus')
+  original7(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'forest.commandStatus', p)
   }
-  @SubscribeMessage('chest.start') chest0(@ConnectedSocket() c: Socket, @MessageBody() p: unknown) {
+
+  @SubscribeMessage('chest.start')
+  chest0(@ConnectedSocket() c: Socket, @MessageBody() p: unknown) {
     return this.run(c, 'chest.start', p)
   }
-  @SubscribeMessage('chest.open') chest1(@ConnectedSocket() c: Socket, @MessageBody() p: unknown) {
+
+  @SubscribeMessage('chest.open')
+  chest1(@ConnectedSocket() c: Socket, @MessageBody() p: unknown) {
     return this.run(c, 'chest.open', p)
   }
-  @SubscribeMessage('chest.cashout') chest2(
-    @ConnectedSocket() c: Socket,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('chest.cashout')
+  chest2(@ConnectedSocket() c: Socket, @MessageBody() p: unknown) {
     return this.run(c, 'chest.cashout', p)
   }
-  @SubscribeMessage('chest.sync') chest3(@ConnectedSocket() c: Socket, @MessageBody() p: unknown) {
+
+  @SubscribeMessage('chest.sync')
+  chest3(@ConnectedSocket() c: Socket, @MessageBody() p: unknown) {
     return this.run(c, 'chest.sync', p)
   }
-  @SubscribeMessage('chest.commandStatus') chest4(
-    @ConnectedSocket() c: Socket,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('chest.commandStatus')
+  chest4(@ConnectedSocket() c: Socket, @MessageBody() p: unknown) {
     return this.run(c, 'chest.commandStatus', p)
   }
-  @SubscribeMessage('caches.start') original8(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('caches.start')
+  original8(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'caches.start', p)
   }
-  @SubscribeMessage('caches.reveal') original9(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('caches.reveal')
+  original9(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'caches.reveal', p)
   }
-  @SubscribeMessage('caches.cashout') original10(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('caches.cashout')
+  original10(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'caches.cashout', p)
   }
-  @SubscribeMessage('caches.sync') original11(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('caches.sync')
+  original11(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'caches.sync', p)
   }
-  @SubscribeMessage('caches.commandStatus') original12(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('caches.commandStatus')
+  original12(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'caches.commandStatus', p)
   }
-  @SubscribeMessage('jackpots.sync') original13(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('jackpots.sync')
+  original13(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'jackpots.sync', p)
   }
-  @SubscribeMessage('jackpots.reveal') original14(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('jackpots.reveal')
+  original14(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'jackpots.reveal', p)
   }
-  @SubscribeMessage('jackpots.claim') original15(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('jackpots.claim')
+  original15(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'jackpots.claim', p)
   }
-  @SubscribeMessage('jackpots.commandStatus') original16(
-    @ConnectedSocket() c: Client,
-    @MessageBody() p: unknown,
-  ) {
+
+  @SubscribeMessage('jackpots.commandStatus')
+  original16(@ConnectedSocket() c: Client, @MessageBody() p: unknown) {
     return this.run(c, 'jackpots.commandStatus', p)
   }
 }

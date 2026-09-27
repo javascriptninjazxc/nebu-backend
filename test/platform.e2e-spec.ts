@@ -1,21 +1,26 @@
 import { Body, Controller, Get, Post } from '@nestjs/common'
-import { Test } from '@nestjs/testing'
 import type { NestExpressApplication } from '@nestjs/platform-express'
+import { Test } from '@nestjs/testing'
 import { IsInt, Min } from 'class-validator'
 import request from 'supertest'
 import { configureApp } from '../src/config/configure-app.js'
 import { readEnvironment } from '../src/config/environment.js'
 
 class SampleDto {
-  @IsInt() @Min(1) amount!: number
+  @IsInt()
+  @Min(1)
+  amount!: number
 }
 
 @Controller('probe')
 class ProbeController {
-  @Post() accept(@Body() body: SampleDto) {
+  @Post()
+  accept(@Body() body: SampleDto) {
     return body
   }
-  @Get('failure') fail() {
+
+  @Get('failure')
+  fail() {
     throw new Error('private database credentials')
   }
 }

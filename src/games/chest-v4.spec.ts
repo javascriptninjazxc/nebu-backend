@@ -1,11 +1,11 @@
+import { chestFraction } from './chest-rules.js'
 import {
   calculateSpinOutcome,
   checkForKey,
-  isChestClosed,
-  chestV4Value,
   CHEST_V4_SURVIVAL,
+  chestV4Value,
+  isChestClosed,
 } from './chest-v4.js'
-import { chestFraction } from './chest-rules.js'
 
 describe('chest-4 exact math', () => {
   it('has exclusive 10 silver and 1 gold outcomes out of 200', () => {

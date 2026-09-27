@@ -1,13 +1,13 @@
 import {
-  CHEST_ODDS,
   CHEST_BONUS_ODDS,
   CHEST_MULTIPLIERS,
-  chestPay,
-  chestKey,
+  CHEST_ODDS,
   chestBoostedPay,
   chestFraction,
-  chestV3Value,
+  chestKey,
+  chestPay,
   chestV3Odds,
+  chestV3Value,
 } from './chest-rules.js'
 
 describe('greedy chest economy', () => {

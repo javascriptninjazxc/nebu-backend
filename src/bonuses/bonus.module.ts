@@ -1,9 +1,10 @@
-﻿import { Module } from '@nestjs/common'
-import { BonusService } from './bonus.service.js'
+import { Module } from '@nestjs/common'
 import { BonusController } from './bonus.controller.js'
+import { BonusRepository } from './bonus.repository.js'
+import { BonusService } from './bonus.service.js'
 
 @Module({
-  providers: [BonusService],
+  providers: [BonusRepository, BonusService],
   controllers: [BonusController],
   exports: [BonusService],
 })

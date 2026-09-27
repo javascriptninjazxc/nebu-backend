@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common'
 import { SequelizeModule } from '@nestjs/sequelize'
+import { databaseModels } from './models.js'
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { SequelizeModule } from '@nestjs/sequelize'
           dialect: 'postgres' as const,
           uri,
           autoLoadModels: true,
+          models: databaseModels,
           synchronize: false,
           logging: false,
           retryAttempts: 1,

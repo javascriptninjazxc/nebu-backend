@@ -1,5 +1,5 @@
-import { Test } from '@nestjs/testing'
 import type { NestExpressApplication } from '@nestjs/platform-express'
+import { Test } from '@nestjs/testing'
 import request from 'supertest'
 import { AppModule } from '../src/app.module.js'
 import { configureApp } from '../src/config/configure-app.js'
